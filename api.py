@@ -1,6 +1,13 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+app = FastAPI()
+
+# ----- Load model -----
 
 text = open("input.txt").read()
 
@@ -8,21 +15,10 @@ chars = sorted(list(set(text)))
 stoi = {c:i for i,c in enumerate(chars)}
 itos = {i:c for c,i in stoi.items()}
 
-def encode(s): return [stoi[c] for c in s]
+def encode(s): return [stoi[c] for c in s if c in stoi]
 def decode(l): return ''.join([itos[i] for i in l])
 
-data = torch.tensor(encode(text), dtype=torch.long)
-
-block_size = 32
-batch_size = 16
 embed_size = 64
-heads = 4
-
-def get_batch():
-    ix = torch.randint(len(data)-block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
-    return x, y
 
 class Attention(nn.Module):
     def __init__(self):
@@ -35,11 +31,9 @@ class Attention(nn.Module):
         k = self.key(x)
         q = self.query(x)
         v = self.value(x)
-
-        weights = q @ k.transpose(-2, -1)
-        weights = F.softmax(weights, dim=-1)
-
-        return weights @ v
+        w = q @ k.transpose(-2, -1)
+        w = F.softmax(w, dim=-1)
+        return w @ v
 
 class Block(nn.Module):
     def __init__(self):
@@ -60,43 +54,42 @@ class GPT(nn.Module):
     def __init__(self):
         super().__init__()
         self.embed = nn.Embedding(len(chars), embed_size)
-        self.blocks = nn.Sequential(
-            Block(),
-            Block(),
-            Block()
-        )
+        self.blocks = nn.Sequential(Block(), Block(), Block())
         self.fc = nn.Linear(embed_size, len(chars))
 
     def forward(self, x):
         x = self.embed(x)
         x = self.blocks(x)
-        x = self.fc(x)
-        return x
+        return self.fc(x)
 
 model = GPT()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+model.load_state_dict(torch.load("model.pt"))
+model.eval()
 
-for step in range(4000):
-    xb, yb = get_batch()
-    logits = model(xb)
+conversation = []
 
-    loss = F.cross_entropy(logits.view(-1, len(chars)), yb.view(-1))
+def generate(prompt, tokens=200, temperature=0.8, top_k=20):
+    idx = torch.tensor([encode(prompt)], dtype=torch.long)
 
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+    for _ in range(tokens):
+        logits = model(idx)[:, -1, :] / temperature
 
-    if step % 500 == 0:
-        print(step, loss.item())
+        v, ix = torch.topk(logits, top_k)
+        probs = F.softmax(v, dim=-1)
 
-context = torch.zeros((1,1), dtype=torch.long)
+        next = ix[0][torch.multinomial(probs, 1)]
+        idx = torch.cat((idx, next.view(1,1)), dim=1)
 
-for _ in range(300):
-    logits = model(context)
-    probs = F.softmax(logits[:, -1, :], dim=-1)
-    next = torch.multinomial(probs, 1)
-    context = torch.cat((context, next), dim=1)
+    return decode(idx[0].tolist())
 
-print(decode(context[0].tolist()))
+class Msg(BaseModel):
+    message: str
 
-torch.save(model.state_dict(), "model.pt")
+@app.post("/chat")
+def chat(msg: Msg):
+    conversation.append(f"User: {msg.message}\nAssistant:")
+    prompt = "".join(conversation)[-800:]
+    out = generate(prompt)
+    reply = out.split("Assistant:")[-1]
+    conversation.append(reply + "\n")
+    return {"reply": reply.strip()}
